@@ -1,0 +1,7 @@
+cradle:
+  cabal:
+    - path: "src"
+      component: "lib:lens-recursion-schemes"
+
+    - path: "test"
+      component: "lens-recursion-schemes:test:lens-recursion-schemes-test"
