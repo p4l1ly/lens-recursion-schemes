@@ -29,7 +29,7 @@ import Control.RecursionSchemes.Lens
   , recursiveSetter
   , corecursiveSetter
   , ana
-  , recur
+  , hylo
   , hashConsOf
   , noConsOf
   , cataT
@@ -176,7 +176,7 @@ main = (check =<<)$ runTestTT$ TestList$
         $ 3 & ana corecursiveSetter %~ listFCoalg
   , "hylo" ~: do
       assertEqual "sum [3..0]" 6
-        $ 3 & recur mapped %~ \(rec, i) -> listFCoalg i & rec & listFAlg
+        $ 3 & hylo mapped %~ \i -> (listFCoalg i, listFAlg)
   , "consing" ~: do
       assertEqual "hashcons" [ValF 1, AddF 0 0] $ snd$ runIdentity$
         cataT recursiveTraversal `hashConsOf` FAdd (FVal 1) (FVal 1)

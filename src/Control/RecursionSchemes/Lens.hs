@@ -9,7 +9,7 @@
 module Control.RecursionSchemes.Lens where
 
 import Data.Functor.Compose
-import Control.Monad.Cont
+import Control.Monad.Reader
 import Control.Monad.State
 import Control.Monad.Writer
 import Control.Arrow
@@ -34,31 +34,32 @@ sideCata
   -> Setter t1 a t2 a
 sideCata t1t2 t1t1 = sets$ \eval -> let rec = t1t2 %~ eval >>> t1t1 %~ rec in rec
 
-recur :: Setter ta tb a b -> Setter a b (ta -> tb, a) b
-recur setter = sets$ \eval -> let rec = curry eval$ setter %~ rec in rec
-
-recur2cata apply alg (tt2ta, tt) = alg `apply` tt2ta tt
-recur2ana apply coalg (ta2tt, a) = ta2tt `apply` coalg a
+hylo :: Setter ta tb a b -> Setter a b a (ta, tb -> b)
+hylo setter = sets$ \eval ->
+  let rec = eval >>> first (setter %~ rec) >>> uncurry (&) in rec
 
 cata :: Setter tt ta tt a -> Setter tt a ta a
-cata setter = recur setter . sets (recur2cata ($))
+cata setter = hylo setter . sets (\alg a -> (a, alg))
 
 ana :: Setter ta tt a tt -> Setter a tt a ta
-ana setter = recur setter . sets (recur2ana ($))
+ana setter = hylo setter . sets (\coalg a -> (coalg a, id))
 
-recurT :: forall m ta tb a b. Monad m =>
-  LensLike m ta tb a b -> LensLike m a b (ta -> m tb, a) b
-recurT setter eval = rec where rec = curry eval$ traverseOf setter rec
+hyloT :: forall m ta tb a b. Monad m =>
+  LensLike m ta tb a b -> LensLike m a b a (ta, tb -> m b)
+hyloT setter eval = rec where
+  rec a = do
+    (ta, tb2b) <- eval a
+    tb2b =<< traverseOf setter rec ta
 
 cataT :: Monad m => LensLike m tt ta tt a -> LensLike m tt a ta a
-cataT setter = recurT setter . recur2cata (=<<)
+cataT setter = hyloT setter . \alg tt -> return (tt, alg)
 
 anaT :: Monad m => LensLike m ta tt a tt -> LensLike m a tt a ta
-anaT setter = recurT setter . recur2ana (=<<)
+anaT setter = hyloT setter . \coalg ta -> coalg ta <&> (, return)
 
 -- Ixed recursion
 
-recurScan ::
+hyloScan ::
   ( Functor f
   , Ixed (f a)
   , Ixed (f b)
@@ -67,9 +68,10 @@ recurScan ::
   , a ~ IxValue (f a)
   , b ~ IxValue (f b)
   )
-  => Setter ti tb i b -> Setter (f a) (f b) (ti -> tb, a) b
-recurScan setter = sets$ \eval arr ->
-  let arr' = fmap (curry eval$ setter %~ \i -> arr' ^?! ix i) arr in arr'
+  => Setter ti tb i b -> Setter (f a) (f b) a (ti, tb -> b)
+hyloScan setter = sets$ \eval arr ->
+  let arr' = fmap (eval >>> first (setter %~ \i -> arr' ^?! ix i) >>> uncurry (&)) arr
+  in arr'
 
 cataScan ::
   ( Functor f
@@ -81,7 +83,7 @@ cataScan ::
   , ti ~ IxValue (f ti)
   )
   => Setter ti ta i a -> Setter (f ti) (f a) ta a
-cataScan setter = recurScan setter . sets (recur2cata ($))
+cataScan setter = hyloScan setter . sets (\alg a -> (a, alg))
 
 anaScan ::
   ( Functor f
@@ -93,19 +95,22 @@ anaScan ::
   , t ~ IxValue (f t)
   )
   => Setter ta t ix t -> Setter (f a) (f t) a ta
-anaScan setter = recurScan setter . sets (recur2ana ($))
+anaScan setter = hyloScan setter . sets (\coalg a -> (coalg a, id))
 
--- MArray recursion
+-- MArray double bottom-up recursion (the first scan is actually a fmap a -> ti)
 
-recurScanT :: forall s mt i ti tb a b.
+hyloScanT :: forall s mt i ti tb a b.
   (MonadTrans mt, Monad (mt (ST s)), Ix i)
   => LensLike (ST s) ti tb i b
-  -> LensLike (mt (ST s)) (Array i a) (Array i b) (ti -> ST s tb, a) b
-recurScanT setter eval as = do
+  -> LensLike (mt (ST s)) (Array i a) (Array i b) a (ti, tb -> mt (ST s) b)
+hyloScanT setter eval as = do
   let bnds = bounds as
   (bs :: STArray s i b) <- lift$ newArray_ bnds
   forM_ (assocs as)$ \(i, a) -> do
-    b <- eval$ (, a)$ traverseOf setter$ readArray bs
+    b <- do
+      (ti, tb2b) <- eval a
+      tb <- lift$ traverseOf setter (readArray bs) ti
+      tb2b tb
     lift$ writeArray bs i b
   lift$ unsafeFreeze bs
 
@@ -113,22 +118,21 @@ cataScanT ::
   (MonadTrans mt, Monad (mt (ST s)), Ix i)
   => LensLike (ST s) ti ta i a
   -> LensLike (mt (ST s)) (Array i ti) (Array i a) ta a
-cataScanT setter = recurScanT setter . \alg (ti2ta, ti) -> alg =<< lift (ti2ta ti)
+cataScanT setter = hyloScanT setter . \alg ti -> return (ti, alg)
 
 anaScanT ::
   (MonadTrans mt, Monad (mt (ST s)), Ix i)
   => LensLike (ST s) ta t i t
   -> LensLike (mt (ST s)) (Array i a) (Array i t) a ta
-anaScanT setter = recurScanT setter . \coalg (ti2ta, ti) -> lift . ti2ta =<< coalg ti
+anaScanT setter = hyloScanT setter . \coalg a -> coalg a <&> (, return)
 
+-- MArray top-down ana
 
--- MArray better ana
-
-anaScanT2 :: forall mt i g tgi arr m tgi'.
-  (MonadTrans mt, Monad (mt m), Ix i, Monoid g, MArray arr g m)
+anaScanT2List :: forall mt i g tgi arr m tgi'.
+  (MonadTrans mt, Monad (mt m), Ix i, Semigroup g, MArray arr g m)
   => LensLike m tgi tgi' (g, i) (g, i)
   -> LensLike (mt m) (arr i g) [tgi'] g tgi
-anaScanT2 setter eval gs = do
+anaScanT2List setter eval gs = do
   bnds <- lift$ getBounds gs
   (reverse <$>) . forM (reverse$ range bnds)$ \i -> do
     g <- lift$ readArray gs i
@@ -139,74 +143,133 @@ anaScanT2 setter eval gs = do
       writeArray gs j gj'
       return (gj', j)
 
-recurScanT2 :: forall mt i g tgi arr m tb b.
-  (MonadTrans mt, Monad (mt m), Ix i, Monoid g, MArray arr g m, MArray arr b m)
-  => LensLike (BeforeAfter m m) tgi tb (g, i) b
-  -> LensLike (mt m) (arr i g) (arr i b) (tgi -> mt m tb, (g, i)) b
-recurScanT2 setter eval gs = do
+-- MArray top-down-bottom-up hylo
+
+data Enclosing m1 m2 a = Enclosing (m1 ()) (m2 a)
+instance Functor m2 => Functor (Enclosing m1 m2) where
+  fmap fn (Enclosing before after) = Enclosing before (fn <$> after)
+instance (Applicative m1, Applicative m2) => Applicative (Enclosing m1 m2) where
+  pure x = Enclosing (pure ()) (pure x)
+  Enclosing bef1 fab <*> Enclosing bef2 fa =
+    Enclosing (bef1 *> bef2) (fab <*> fa)
+
+simpleEncloser ::
+  (Ix i, Semigroup g, MArray arr' b m, MArray arr g m)
+  => LensLike (Enclosing m (ReaderT (arr' i b) m)) tgi tb (g, i) b
+  -> arr i g -> tgi -> m ((cs, arr' i b) -> m tb)
+simpleEncloser setter gs tgi = do
+  let Enclosing before after = flip (traverseOf setter) tgi$ \(g, j) -> Enclosing
+        (readArray gs j >>= writeArray gs j . (<> g))
+        (ask >>= \bs -> lift$ readArray bs j)
+  before
+  return$ \(_, bs) -> runReaderT after bs
+
+sideEncloser ::
+  (Ix i, Semigroup g, MArray arr' b m, MArray arr g m)
+  => LensLike (Enclosing m (ReaderT (arr' i b) m)) tgi tb (g, i) b
+  -> arr i g -> tgi -> m ((cs, arr' i b) -> m tb)
+sideEncloser setter gs tgi = do
+  let Enclosing before after = flip (traverseOf setter) tgi$ \(g, j) -> Enclosing
+        (readArray gs j >>= writeArray gs j . (<> g))
+        (ask >>= \bs -> lift$ readArray bs j)
+  before
+  return$ \(_, bs) -> runReaderT after bs
+
+hyloScanT00 :: forall mt i g tgi arr arr' m tb b cs.
+  (MonadTrans mt, Monad (mt m), Ix i, MArray arr g m, MArray arr' b m)
+  => mt m cs
+  -> (tgi -> m ((cs, arr' i b) -> m tb))
+  -> LensLike (mt m) (arr i g) (cs, arr' i b) (g, i) (tgi, tb -> mt m b)
+hyloScanT00 atTheBottom encloser eval gs = do
   bnds <- lift$ getBounds gs
   bs <- lift$ newArray_ bnds
 
   let
-    step :: [i] -> mt m () -> mt m ()
+    step :: [i] -> mt m cs -> mt m cs
     step [] previousStep = previousStep
     step (i:rest) previousStep = do
       step rest$ do
         g <- lift$ readArray gs i
-        b <- eval$ (, (g, i))$ \tgi -> do
-          let
-            BeforeAfter before after =
-              flip (traverseOf setter) tgi$ \(gj, j) -> BeforeAfter
-                (readArray gs j >>= writeArray gs j . (gj <>))
-                (readArray bs j)
-          lift before
-          previousStep
-          lift after
+        (tgi, tb2b) <- eval (g, i)
+        after <- lift$ encloser tgi
+        cs <- previousStep
+        b <- lift (after (cs, bs)) >>= tb2b
         lift$ writeArray bs i b
+        return cs
 
-  step (range bnds) (return ())
-  return bs
+  (, bs) <$> step (range bnds) atTheBottom
 
-recurScanT3 :: forall mt i g tgi arr m tb b r.
-  (MonadTrans mt, Monad (mt m), Ix i, Monoid g, MArray arr g m, MArray arr b m)
-  => LensLike (BeforeAfter m m) tgi tb (g, i) b
-  -> LensLike (ContT r (mt m)) (arr i g) (arr i b) (tgi -> ContT r (mt m) tb, (g, i)) b
-recurScanT3 setter eval gs = do
-  bnds <- lift$lift$ getBounds gs
-  bs <- lift$lift$ newArray_ bnds
+hyloScanT0 :: forall mt i g tgi arr arr' m tb b c cs.
+  (MonadTrans mt, Monad (mt m), Ix i, MArray arr g m, MArray arr' b m)
+  => mt m cs
+  -> LensLike (Enclosing m (ReaderT cs m)) tgi tb (m (), cs -> arr' i b -> m c) c
+  -> LensLike (mt m) (arr i g) (cs, arr' i b) (g, i) (tgi, tb -> mt m b)
+hyloScanT0 atTheBottom setter eval gs = do
+  bnds <- lift$ getBounds gs
+  bs <- lift$ newArray_ bnds
 
   let
-    step :: [i] -> ContT r (mt m) () -> ContT r (mt m) ()
+    step :: [i] -> mt m cs -> mt m cs
     step [] previousStep = previousStep
     step (i:rest) previousStep = do
       step rest$ do
-        g <- lift$lift$ readArray gs i
-        b <- callCC$ \exitWrite -> do
-          continue <- callCC$ \exitToPrevious -> do
-            b <- eval$ (, (g, i))$ \tgi -> do
-              let
-                BeforeAfter before after =
-                  flip (traverseOf setter) tgi$ \(gj, j) -> BeforeAfter
-                    (readArray gs j >>= writeArray gs j . (gj <>))
-                    (readArray bs j)
-              lift$lift$ before
-              callCC exitToPrevious
-              lift$lift$ after
-            exitWrite b
-          previousStep
-          continue ()
-        lift$lift$ writeArray bs i b
+        g <- lift$ readArray gs i
+        (tgi, tb2b) <- eval (g, i)
+        let Enclosing before after =
+              flip (traverseOf setter) tgi$ \(bef, aft) ->
+                Enclosing bef (ask >>= \cs -> lift$ aft cs bs)
+        lift before
+        cs <- previousStep
+        b <- lift (runReaderT after cs) >>= tb2b
+        lift$ writeArray bs i b
+        return cs
 
-  step (range bnds) (return ())
-  return bs
+  (, bs) <$> step (range bnds) atTheBottom
 
-data BeforeAfter m1 m2 a = BeforeAfter (m1 ()) (m2 a)
-instance Functor m2 => Functor (BeforeAfter m1 m2) where
-  fmap fn (BeforeAfter before after) = BeforeAfter before (fn <$> after)
-instance (Applicative m1, Applicative m2) => Applicative (BeforeAfter m1 m2) where
-  pure x = BeforeAfter (pure ()) (pure x)
-  BeforeAfter bef1 fab <*> BeforeAfter bef2 fa =
-    BeforeAfter (bef1 *> bef2) (fab <*> fa)
+hyloScanT2 :: forall mt i g tgi arr arr' m tb b.
+  (MonadTrans mt, Monad (mt m), Ix i, Semigroup g, MArray arr g m, MArray arr' b m)
+  => LensLike (Enclosing m (ReaderT (arr' i b) m)) tgi tb (g, i) b
+  -> LensLike (mt m) (arr i g) (arr' i b) (g, i) (tgi, tb -> mt m b)
+hyloScanT2 setter eval gs =
+  snd <$> hyloScanT00 (return ()) (simpleEncloser setter gs) eval gs
+
+newtype Keep a = Keep {unKeep :: a}
+instance Semigroup (Keep a) where x <> _ = x
+
+-- Semantically equivalent to cataScanT but a bit more complex to implement
+-- via hyloScanT2 as we need to make some dummy operations for types to fit.
+cataScanT2 :: forall mt i ti arr arr' m ta a.
+  ( MonadTrans mt, Monad (mt m), Ix i
+  , MArray arr ti m
+  , MArray arr (Keep ti) m
+  , MArray arr' a m
+  )
+  => Traversal ti ta i a
+  -> LensLike (mt m) (arr i ti) (arr' i a) ta a
+cataScanT2 setter alg arr = do
+  let setter' ktii2a = setter (ktii2a . (undefined,))
+  let hyloAlg (Keep ti, _) = return (ti, alg)
+  (arr' :: Array i ti) <- lift$ unsafeFreeze arr  -- noop
+  (arr'' :: arr i (Keep ti)) <- lift$ unsafeThaw$ fmap Keep arr'  -- noop
+  hyloScanT2 setter' hyloAlg arr''
+
+-- cataScanT implemented via hyloScanT2
+cataScanT2' :: forall mt s i ti ta a.
+  (MonadTrans mt, Monad (mt (ST s)), Ix i)
+  => Traversal ti ta i a
+  -> LensLike (mt (ST s)) (Array i ti) (Array i a) ta a
+cataScanT2' setter alg arr = do
+  let setter' ktii2a = setter (ktii2a . (undefined,))
+  let hyloAlg (Keep ti, _) = return (ti, alg)
+  (arr' :: STArray s i (Keep ti)) <- lift$ unsafeThaw$ fmap Keep arr  -- noop
+  (result :: STArray s i a) <- hyloScanT2 setter' hyloAlg arr'
+  lift$ unsafeFreeze result  -- noop
+
+anaScanT2 ::
+  (MonadTrans mt, Monad (mt m), Ix i, Monoid g, MArray arr g m, MArray arr' t m)
+  => Traversal tgi t (g, i) t
+  -> LensLike (mt m) (arr i g) (arr' i t) (g, i) tgi
+anaScanT2 setter = hyloScanT2 setter . \coalg a -> coalg a <&> (, return)
 
 -- Building Arrays (NoCons)
 
@@ -290,14 +353,15 @@ cataScanFn :: Functor f => (f a -> a) -> Array Int (f Int) -> Array Int a
 cataScanFn alg = cataScan mapped %~ alg
 
 hyloFunctorScan :: Functor f => (f b -> b) -> (a -> f Int) -> Array Int a -> Array Int b
-hyloFunctorScan alg coalg = recurScan mapped %~ \(f, a) -> alg $ f $ coalg a
+hyloFunctorScan alg coalg = hyloScan mapped %~ \a -> (coalg a, alg)
 
 hyloFunctor :: Functor f => (f b -> b) -> (a -> f a) -> a -> b
-hyloFunctor alg coalg = recur mapped %~ \(f, a) -> alg $ f $ coalg a
+hyloFunctor alg coalg = hylo mapped %~ \a -> (coalg a, alg)
 
-hyloT :: (Traversable f, Monad m) => (f b -> m b) -> (a -> m (f a)) -> a -> m b
-hyloT alg coalg = traverseOf (recurT traversed)$ \(fa2fb, a) ->
-  coalg a >>= fa2fb >>= alg
+hyloTraversable ::
+  (Traversable f, Monad m)
+  => (f b -> m b) -> (a -> m (f a)) -> a -> m b
+hyloTraversable alg coalg = traverseOf (hyloT traversed)$ \a -> coalg a <&> (, alg)
 
 cocoRecursive
   :: (Recursive t, Functor g, f ~ Base t, h ~ Base u, Corecursive u)
