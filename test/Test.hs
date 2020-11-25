@@ -14,10 +14,10 @@ import GHC.Generics
 import Data.Functor.Classes
 import Generic.Data (Generically1(..))
 import Generic.Data.Orphans ()
-
 import Test.HUnit
 import Control.Lens
 import Control.Monad
+import Control.Monad.ST
 import Data.Fix (Fix(..))
 import Data.Functor.Foldable (ListF(..))
 import Data.Hashable
@@ -37,6 +37,8 @@ import Control.RecursionSchemes.Lens
   , recursiveTraversal
   , corecursiveTraversal
   )
+
+import qualified Test.Afa
 
 -- Functor Expr
 data ExprF rec = AddF rec rec | ValF Int
@@ -198,4 +200,9 @@ main = (check =<<)$ runTestTT$ TestList$
             3
           :: [Fix ExprF]
         )
+  , "removeOrphans" ~: do
+      putStrLn "FOOOOO"
+      print$ runST Test.Afa.removeOrphans
+      putStrLn "FOOOOO"
+      print$ runST Test.Afa.removeOrphans'
   ]

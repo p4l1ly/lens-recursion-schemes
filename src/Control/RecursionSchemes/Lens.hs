@@ -28,12 +28,6 @@ import Control.Monad.ST
 recursion :: Setter t a t a -> t -> a
 recursion setter = rec where rec = setter %~ rec
 
-sideCata
-  :: ASetter t1 t1' t2 a
-  -> ASetter t1' a t1 a
-  -> Setter t1 a t2 a
-sideCata t1t2 t1t1 = sets$ \eval -> let rec = t1t2 %~ eval >>> t1t1 %~ rec in rec
-
 hylo :: Setter ta tb a b -> Setter a b a (ta, tb -> b)
 hylo setter = sets$ \eval ->
   let rec = eval >>> first (setter %~ rec) >>> uncurry (&) in rec
@@ -52,10 +46,12 @@ hyloT setter eval = rec where
     tb2b =<< traverseOf setter rec ta
 
 cataT :: Monad m => LensLike m tt ta tt a -> LensLike m tt a ta a
-cataT setter = hyloT setter . \alg tt -> return (tt, alg)
+cataT setter alg = rec where rec = setter rec >=> alg
+  -- equivalent to: hyloT setter . \alg tt -> return (tt, alg)
 
 anaT :: Monad m => LensLike m ta tt a tt -> LensLike m a tt a ta
-anaT setter = hyloT setter . \coalg ta -> coalg ta <&> (, return)
+anaT setter coalg = rec where rec = coalg >=> setter rec
+  -- equivalent to: hyloT setter . \coalg ta -> coalg ta <&> (, return)
 
 -- Ixed recursion
 
@@ -154,37 +150,28 @@ instance (Applicative m1, Applicative m2) => Applicative (Enclosing m1 m2) where
     Enclosing (bef2 *> bef1) (fab <*> fa)
 
 simpleEncloser ::
-  (Ix i, Semigroup g, MArray arr' b m, MArray arr g m)
-  => LensLike (Enclosing m (ReaderT (arr' i b) m)) tgi tb (g, i) b
-  -> Getter csbs (arr' i b)
+  (Ix i, Semigroup g, MArray arr' b m, MArray arr g m, MonadTrans mt, Monad (mt m))
+  => LensLike (Enclosing (mt m) (ReaderT csbs (mt m))) tgi tb (g, i) b
+  -> (csbs -> arr' i b)
   -> arr i g
-  -> tgi -> m (csbs -> m tb)
-simpleEncloser setter getter gs tgi = do
-  let Enclosing before after = flip (traverseOf setter) tgi$ \(g, j) -> Enclosing
-        (readArray gs j >>= writeArray gs j . (<> g))
-        (ask >>= \bs -> lift$ readArray bs j)
-  before
-  return$ \csbs -> runReaderT after (csbs^.getter)
+  -> tgi
+  -> Enclosing (mt m) (ReaderT csbs (mt m)) tb
+simpleEncloser setter getter gs tgi = traverseOf setter (arrayEncloser gs getter) tgi
 
--- encloseEncloser ::
---   (Ix i, Semigroup g, MArray arr g m)
---   => LensLike (Enclosing m (ReaderT (arr' i b) m)) tgi tb (g, i) b
---   -> Getter csbs (arr' i b)
---   -> arr i g
---   -> (tgi0 -> m (csbs -> m tgi))
---   -> tgi0 -> m (csbs -> m tb)
--- encloseEncloser setter getter gs inner tgi = do
---   let
---     Enclosing before after = flip (traverseOf setter) tgi$ \(g, j) -> Enclosing
---       (readArray gs j >>= writeArray gs j . (<> g))
---       (ask >>= \bs -> lift$ readArray bs j)
---   before
---   return$ \csbs -> runReaderT after (csbs^.getter)
+arrayEncloser ::
+  (Ix i, Semigroup g, MArray arr' b m, MArray arr g m, MonadTrans mt, Monad (mt m))
+  => arr i g
+  -> (e -> arr' i b)
+  -> (g, i)
+  -> Enclosing (mt m) (ReaderT e (mt m)) b
+arrayEncloser gs getBs (g, j) = Enclosing
+  (lift (readArray gs j) >>= lift . writeArray gs j . (<> g))
+  (asks getBs >>= \bs -> lift$lift$ readArray bs j)
 
 hyloScanT00 :: forall mt i g tgi arr arr' m tb b cs.
   (MonadTrans mt, Monad (mt m), Ix i, MArray arr g m, MArray arr' b m)
   => mt m cs
-  -> (tgi -> m ((cs, arr' i b) -> m tb))
+  -> (tgi -> Enclosing (mt m) (ReaderT (cs, arr' i b) (mt m)) tb)
   -> LensLike (mt m) (arr i g) (cs, arr' i b) (g, i) (tgi, tb -> mt m b)
 hyloScanT00 atTheBottom encloser eval gs = do
   bnds <- lift$ getBounds gs
@@ -197,20 +184,29 @@ hyloScanT00 atTheBottom encloser eval gs = do
       step rest$ do
         g <- lift$ readArray gs i
         (tgi, tb2b) <- eval (g, i)
-        after <- lift$ encloser tgi
+        let Enclosing before after = encloser tgi
+        before
         cs <- previousStep
-        b <- lift (after (cs, bs)) >>= tb2b
+        tb <- runReaderT after (cs, bs)
+        b <- tb2b tb
         lift$ writeArray bs i b
         return cs
 
   (, bs) <$> step (range bnds) atTheBottom
 
+hyloScanT00' :: forall mt i g tgi arr m tb b cs.
+  (MonadTrans mt, Monad (mt m), Ix i, MArray arr g m, MArray arr b m)
+  => mt m cs
+  -> (tgi -> Enclosing (mt m) (ReaderT (cs, arr i b) (mt m)) tb)
+  -> LensLike (mt m) (arr i g) (cs, arr i b) (g, i) (tgi, tb -> mt m b)
+hyloScanT00' = hyloScanT00
+
 hyloScanT2 :: forall mt i g tgi arr arr' m tb b.
   (MonadTrans mt, Monad (mt m), Ix i, Semigroup g, MArray arr g m, MArray arr' b m)
-  => LensLike (Enclosing m (ReaderT (arr' i b) m)) tgi tb (g, i) b
+  => LensLike (Enclosing (mt m) (ReaderT ((), arr' i b) (mt m))) tgi tb (g, i) b
   -> LensLike (mt m) (arr i g) (arr' i b) (g, i) (tgi, tb -> mt m b)
 hyloScanT2 setter eval gs =
-  snd <$> hyloScanT00 (return ()) (simpleEncloser setter _2 gs) eval gs
+  snd <$> hyloScanT00 (return ()) (simpleEncloser setter snd gs) eval gs
 
 newtype Keep a = Keep {unKeep :: a}
 instance Semigroup (Keep a) where x <> _ = x
@@ -351,3 +347,11 @@ consuRecursive
   :: (Recursive t, Functor g, f ~ Base t, Functor h)
   => (g (f t) -> h (g t)) -> (h a -> a) -> g t -> a
 consuRecursive coalg alg = hyloFunctor alg (coalg . fmap project)
+
+-- Miscellaneous
+
+sideCata
+  :: ASetter t1 t1' t2 a
+  -> ASetter t1' a t1 a
+  -> Setter t1 a t2 a
+sideCata t1t2 t1t1 = sets$ \eval -> let rec = t1t2 %~ eval >>> t1t1 %~ rec in rec
