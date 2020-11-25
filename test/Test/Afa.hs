@@ -39,7 +39,7 @@ instance (Eq i, Eq1 f) => Eq (Tree f i) where
 
 instance (Show i, Show1 f) => Show (Tree f i) where
   showsPrec d (Leaf a) = showParen (d >= 11)$ showString "Leaf " . showsPrec 11 a 
-  showsPrec d (Node a) = showParen (d >= 11)$ showString "Leaf " . showsPrec1 11 a 
+  showsPrec d (Node a) = showParen (d >= 11)$ showString "Node " . showsPrec1 11 a 
 
 treeModChilds :: Functor m
   => (i -> m j)
