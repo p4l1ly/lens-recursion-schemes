@@ -167,6 +167,16 @@ arrayEncloser gs getBs (g, j) = Enclosing
   (readArray gs j >>= writeArray gs j . (<> g))
   (asks getBs >>= \bs -> lift$ readArray bs j)
 
+arrayEncloser' ::
+  (Ix i, Semigroup g, MArray arr g m)
+  => arr i g
+  -> (e -> Array i b)
+  -> (g, i)
+  -> Enclosing m (ReaderT e m) b
+arrayEncloser' gs getBs (g, j) = Enclosing
+  (readArray gs j >>= writeArray gs j . (<> g))
+  (asks getBs <&> (!j))
+
 hyloScanT00 :: forall i g tgi arr arr' m tb b cs env.
   (Ix i, MArray arr g m, MArray arr' b m)
   => m cs
