@@ -1,7 +1,8 @@
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
-{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 
 module Test.Afa where
 
@@ -11,6 +12,7 @@ import Control.Lens
 import Data.Monoid
 import Control.Monad.ST
 import Data.Array
+import Data.Array.Base (MArray(..))
 import Data.Array.MArray
 import Data.Array.ST
 import Data.Traversable
@@ -25,9 +27,28 @@ import Control.RecursionSchemes.Lens
   , arrayEncloser
   , Enclosing(..)
   , hyloScanT00'
+  , hyloScanTTerminal'
   , runNoConsT
   , nocons
   )
+
+newtype LiftedArray a i e = LiftedArray (a i e)
+instance (MonadTrans mt, Monad (mt m), MArray a e m)
+  => MArray (LiftedArray a) e (mt m) where
+  {-# INLINE getBounds #-}
+  getBounds (LiftedArray arr) = lift$ getBounds arr
+  {-# INLINE unsafeRead #-}
+  unsafeRead (LiftedArray arr) i = lift$ unsafeRead arr i
+  {-# INLINE unsafeWrite #-}
+  unsafeWrite (LiftedArray arr) i v = lift$ unsafeWrite arr i v
+  {-# INLINE getNumElements #-}
+  getNumElements (LiftedArray arr) = lift$ getNumElements arr
+  {-# INLINE newArray #-}
+  newArray bnds e = LiftedArray<$> lift (newArray bnds e)
+  {-# INLINE newArray_ #-}
+  newArray_ bnds = LiftedArray<$> lift (newArray_ bnds)
+  {-# INLINE unsafeNewArray_ #-}
+  unsafeNewArray_ bnds = LiftedArray<$> lift (unsafeNewArray_ bnds)
 
 newtype Tree f i = Tree (Either i (f (Tree f i)))
 pattern Node x = Tree (Right x)
@@ -99,36 +120,35 @@ removeOrphans :: forall s. ST s
   , Array Int (BoolP Int)
   )
 removeOrphans = do
-  (pReach :: STArray s Int Any) <- newArray (bounds ps) (Any False)
   (tReach :: STArray s Int Any) <- newArray (bounds ts) (Any False)
-  let Enclosing qBefore qAfter = simpleEncloser traversed id tReach$ map (Any True,) qs
-  runIdentityT qBefore
+  (pReach :: STArray s Int Any) <- newArray (bounds ps) (Any False)
+  let tReach' = LiftedArray tReach
+  let pReach' = LiftedArray pReach
+  let Enclosing qBefore qAfter = simpleEncloser traversed tReach$ map (Any True,) qs
 
-  let pScan = runNoConsT$ hyloScanT00'
-        (return ()) (simpleEncloser traversed snd pReach) pHylogebra pReach
+  qBefore
+  (((_, psList), LiftedArray tsMapping), tsList) <- runNoConsT$ hyloScanT00'
+    (lift$ runNoConsT$ hyloScanTTerminal' traversed pHylogebra pReach')
+    (\ts (ps, _) -> (ps, ts))
+    ( T.modChilds T.pureChildMod
+        { T.lT = arrayEncloser tReach' snd
+        , T.lP = arrayEncloser pReach' fst
+        }
+    )
+    tHylogebra
+    tReach'
+  qs' <- runReaderT qAfter tsMapping
 
-  (((_, psList), tsMapping), tsList) <-
-    runNoConsT$ hyloScanT00'
-      ( lift pScan )
-      ( T.modChilds T.pureChildMod
-          { T.lT = arrayEncloser tReach snd
-          , T.lP = arrayEncloser pReach (snd . fst . fst)
-          }
-      )
-      tHylogebra
-      tReach
-
-  qs' <- runIdentityT$ runReaderT qAfter tsMapping
   return (qs', toArr tsList, toArr psList)
 
   where
-  noconsIf (Any False) _ = return (error "unreachable")
+  noconsIf (Any False) _ = return$ error "accessing element without parents"
   noconsIf _ tb = nocons tb
 
   tHylogebra (g, i) = return$ (, noconsIf g)$ runIdentity$
     T.modChilds T.pureChildMod{ T.lT = return . (g,), T.lP = return . (g,) } (ts0!i)
 
-  pHylogebra (g, i) = return$ ((g,) <$> ps0!i, noconsIf g)
+  pHylogebra (g, i) = return ((g,) <$> ps0!i, noconsIf g)
 
 removeOrphans' :: forall s. ST s
   ( [Int]
@@ -136,38 +156,34 @@ removeOrphans' :: forall s. ST s
   , Array Int (Tree BoolP Int)
   )
 removeOrphans' = do
-  (pReach :: STArray s Int Any) <- newArray (bounds ps) (Any False)
   (tReach :: STArray s Int Any) <- newArray (bounds ts) (Any False)
-  let Enclosing qBefore qAfter = simpleEncloser traversed id tReach$ map (Any True,) qs
-  runIdentityT qBefore
+  (pReach :: STArray s Int Any) <- newArray (bounds ps) (Any False)
+  let tReach' = LiftedArray tReach
+  let pReach' = LiftedArray pReach
+  let Enclosing qBefore qAfter = simpleEncloser traversed tReach$ map (Any True,) qs
 
-  let pScan = runNoConsT$ hyloScanT00'
-        (return ())
-        (simpleEncloser traversed snd pReach)
-        pHylogebra
-        pReach
+  qBefore
+  (((_, psList), LiftedArray tsMapping), tsList) <- runNoConsT$ hyloScanT00'
+    (lift$ runNoConsT$ hyloScanTTerminal' traversed pHylogebra pReach')
+    (\ts (ps, _) -> (ps, ts))
+    ( treeModChilds (arrayEncloser tReach' snd)$ \rec ->
+        T.modChilds T.pureChildMod
+          { T.lT = rec
+          , T.lP = arrayEncloser pReach' fst
+          }
+    )
+    tHylogebra
+    tReach'
+  qs' <- runReaderT qAfter tsMapping
 
-  (((_, psList), tsMapping), tsList) <-
-    runNoConsT$ hyloScanT00'
-      ( lift pScan )
-      ( treeModChilds (arrayEncloser tReach snd)$ \rec ->
-          T.modChilds T.pureChildMod
-            { T.lT = rec
-            , T.lP = arrayEncloser pReach (snd . fst . fst)
-            }
-      )
-      tHylogebra
-      tReach
-
-  qs' <- runIdentityT$ runReaderT qAfter tsMapping
   return (qs', toArr tsList, toArr psList)
 
   where
-  noconsIf (Any False) _ = return (error "unreachable")
+  noconsIf (Any False) _ = return$ error "accessing element without parents"
   noconsIf _ tb = nocons tb
 
   tHylogebra (g, i) = return$ (, noconsIf g)$ runIdentity$ ($ ts!i)$
     treeModChilds (return . (g,))$ \rec ->
       T.modChilds T.pureChildMod{ T.lT = rec, T.lP = return . (g,) }
 
-  pHylogebra (g, i) = return$ ((g,) <$> ps!i, noconsIf g)
+  pHylogebra (g, i) = return ((g,) <$> ps!i, noconsIf g)

@@ -150,101 +150,97 @@ instance (Applicative m1, Applicative m2) => Applicative (Enclosing m1 m2) where
     Enclosing (bef2 *> bef1) (fab <*> fa)
 
 simpleEncloser ::
-  (Ix i, Semigroup g, MArray arr' b m, MArray arr g m, MonadTrans mt, Monad (mt m))
-  => LensLike (Enclosing (mt m) (ReaderT csbs (mt m))) tgi tb (g, i) b
-  -> (csbs -> arr' i b)
+  (Ix i, Semigroup g, MArray arr' b m, MArray arr g m)
+  => LensLike (Enclosing m (ReaderT (arr' i b) m)) tgi tb (g, i) b
   -> arr i g
   -> tgi
-  -> Enclosing (mt m) (ReaderT csbs (mt m)) tb
-simpleEncloser setter getter gs tgi = traverseOf setter (arrayEncloser gs getter) tgi
+  -> Enclosing m (ReaderT (arr' i b) m) tb
+simpleEncloser setter gs = traverseOf setter (arrayEncloser gs id)
 
 arrayEncloser ::
-  (Ix i, Semigroup g, MArray arr' b m, MArray arr g m, MonadTrans mt, Monad (mt m))
+  (Ix i, Semigroup g, MArray arr' b m, MArray arr g m)
   => arr i g
   -> (e -> arr' i b)
   -> (g, i)
-  -> Enclosing (mt m) (ReaderT e (mt m)) b
+  -> Enclosing m (ReaderT e m) b
 arrayEncloser gs getBs (g, j) = Enclosing
-  (lift (readArray gs j) >>= lift . writeArray gs j . (<> g))
-  (asks getBs >>= \bs -> lift$lift$ readArray bs j)
+  (readArray gs j >>= writeArray gs j . (<> g))
+  (asks getBs >>= \bs -> lift$ readArray bs j)
 
-hyloScanT00 :: forall mt i g tgi arr arr' m tb b cs.
-  (MonadTrans mt, Monad (mt m), Ix i, MArray arr g m, MArray arr' b m)
-  => mt m cs
-  -> (tgi -> Enclosing (mt m) (ReaderT (cs, arr' i b) (mt m)) tb)
-  -> LensLike (mt m) (arr i g) (cs, arr' i b) (g, i) (tgi, tb -> mt m b)
-hyloScanT00 atTheBottom encloser eval gs = do
-  bnds <- lift$ getBounds gs
-  bs <- lift$ newArray_ bnds
+hyloScanT00 :: forall i g tgi arr arr' m tb b cs env.
+  (Ix i, MArray arr g m, MArray arr' b m)
+  => m cs
+  -> (arr' i b -> cs -> env)
+  -> (tgi -> Enclosing m (ReaderT env m) tb)
+  -> LensLike m (arr i g) (cs, arr' i b) (g, i) (tgi, tb -> m b)
+hyloScanT00 atTheBottom mkenv encloser eval gs = do
+  bnds <- getBounds gs
+  bs <- newArray_ bnds
 
   let
-    step :: [i] -> mt m cs -> mt m cs
+    step :: [i] -> m cs -> m cs
     step [] previousStep = previousStep
     step (i:rest) previousStep = do
       step rest$ do
-        g <- lift$ readArray gs i
+        g <- readArray gs i
         (tgi, tb2b) <- eval (g, i)
         let Enclosing before after = encloser tgi
         before
         cs <- previousStep
-        tb <- runReaderT after (cs, bs)
+        tb <- runReaderT after$ mkenv bs cs
         b <- tb2b tb
-        lift$ writeArray bs i b
+        writeArray bs i b
         return cs
 
   (, bs) <$> step (range bnds) atTheBottom
 
-hyloScanT00' :: forall mt i g tgi arr m tb b cs.
-  (MonadTrans mt, Monad (mt m), Ix i, MArray arr g m, MArray arr b m)
-  => mt m cs
-  -> (tgi -> Enclosing (mt m) (ReaderT (cs, arr i b) (mt m)) tb)
-  -> LensLike (mt m) (arr i g) (cs, arr i b) (g, i) (tgi, tb -> mt m b)
+hyloScanT00' :: forall i g tgi arr m tb b cs env.
+  (Ix i, MArray arr g m, MArray arr b m)
+  => m cs
+  -> (arr i b -> cs -> env)
+  -> (tgi -> Enclosing m (ReaderT env m) tb)
+  -> LensLike m (arr i g) (cs, arr i b) (g, i) (tgi, tb -> m b)
 hyloScanT00' = hyloScanT00
 
-hyloScanT2 :: forall mt i g tgi arr arr' m tb b.
-  (MonadTrans mt, Monad (mt m), Ix i, Semigroup g, MArray arr g m, MArray arr' b m)
-  => LensLike (Enclosing (mt m) (ReaderT ((), arr' i b) (mt m))) tgi tb (g, i) b
-  -> LensLike (mt m) (arr i g) (arr' i b) (g, i) (tgi, tb -> mt m b)
-hyloScanT2 setter eval gs =
-  snd <$> hyloScanT00 (return ()) (simpleEncloser setter snd gs) eval gs
+hyloScanTTerminal :: forall i g tgi arr arr' m tb b.
+  (Ix i, Semigroup g, MArray arr g m, MArray arr' b m)
+  => LensLike (Enclosing m (ReaderT (arr' i b) m)) tgi tb (g, i) b
+  -> LensLike m (arr i g) (arr' i b) (g, i) (tgi, tb -> m b)
+hyloScanTTerminal setter eval gs =
+  snd <$> hyloScanT00 (return ()) const (simpleEncloser setter gs) eval gs
+
+hyloScanTTerminal' :: forall i g tgi arr m tb b.
+  (Ix i, Semigroup g, MArray arr g m, MArray arr b m)
+  => LensLike (Enclosing m (ReaderT (arr i b) m)) tgi tb (g, i) b
+  -> LensLike m (arr i g) (arr i b) (g, i) (tgi, tb -> m b)
+hyloScanTTerminal' setter eval gs =
+  snd <$> hyloScanT00 (return ()) const (simpleEncloser setter gs) eval gs
 
 newtype Keep a = Keep {unKeep :: a}
 instance Semigroup (Keep a) where x <> _ = x
 
 -- Semantically equivalent to cataScanT but a bit more complex to implement
 -- via hyloScanT2 as we need to make some dummy operations for types to fit.
-cataScanT2 :: forall mt i ti arr arr' m ta a.
-  ( MonadTrans mt, Monad (mt m), Ix i
+cataScanT2 :: forall i ti arr arr' m ta a.
+  ( Ix i
   , MArray arr ti m
   , MArray arr (Keep ti) m
   , MArray arr' a m
   )
   => Traversal ti ta i a
-  -> LensLike (mt m) (arr i ti) (arr' i a) ta a
+  -> LensLike m (arr i ti) (arr' i a) ta a
 cataScanT2 setter alg arr = do
   let setter' ktii2a = setter (ktii2a . (undefined,))
   let hyloAlg (Keep ti, _) = return (ti, alg)
-  (arr' :: Array i ti) <- lift$ unsafeFreeze arr  -- noop
-  (arr'' :: arr i (Keep ti)) <- lift$ unsafeThaw$ fmap Keep arr'  -- noop
-  hyloScanT2 setter' hyloAlg arr''
-
--- cataScanT implemented via hyloScanT2
-cataScanT2' :: forall mt s i ti ta a.
-  (MonadTrans mt, Monad (mt (ST s)), Ix i)
-  => Traversal ti ta i a
-  -> LensLike (mt (ST s)) (Array i ti) (Array i a) ta a
-cataScanT2' setter alg arr = do
-  let setter' ktii2a = setter (ktii2a . (undefined,))
-  let hyloAlg (Keep ti, _) = return (ti, alg)
-  (arr' :: STArray s i (Keep ti)) <- lift$ unsafeThaw$ fmap Keep arr  -- noop
-  (result :: STArray s i a) <- hyloScanT2 setter' hyloAlg arr'
-  lift$ unsafeFreeze result  -- noop
+  (arr' :: Array i ti) <- unsafeFreeze arr  -- noop
+  (arr'' :: arr i (Keep ti)) <- unsafeThaw$ fmap Keep arr'  -- noop
+  hyloScanTTerminal setter' hyloAlg arr''
 
 anaScanT2 ::
-  (MonadTrans mt, Monad (mt m), Ix i, Monoid g, MArray arr g m, MArray arr' t m)
+  (Ix i, Monoid g, MArray arr g m, MArray arr' t m)
   => Traversal tgi t (g, i) t
-  -> LensLike (mt m) (arr i g) (arr' i t) (g, i) tgi
-anaScanT2 setter = hyloScanT2 setter . \coalg a -> coalg a <&> (, return)
+  -> LensLike m (arr i g) (arr' i t) (g, i) tgi
+anaScanT2 setter = hyloScanTTerminal setter . \coalg a -> coalg a <&> (, return)
 
 -- Building Arrays (NoCons)
 
