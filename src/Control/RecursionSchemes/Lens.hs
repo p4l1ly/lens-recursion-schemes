@@ -95,31 +95,31 @@ anaScan setter = hyloScan setter . sets (\coalg a -> (coalg a, id))
 
 -- MArray double bottom-up recursion (the first scan is actually a fmap a -> ti)
 
-hyloScanT :: forall s mt i ti tb a b.
-  (MonadTrans mt, Monad (mt (ST s)), Ix i)
-  => LensLike (ST s) ti tb i b
-  -> LensLike (mt (ST s)) (Array i a) (Array i b) a (ti, tb -> mt (ST s) b)
+hyloScanT :: forall m arr i ti tb a b.
+  (Monad m, MArray arr b m, Ix i)
+  => LensLike m ti tb i b
+  -> LensLike m (Array i a) (arr i b) a (ti, tb -> m b)
 hyloScanT setter eval as = do
   let bnds = bounds as
-  (bs :: STArray s i b) <- lift$ newArray_ bnds
+  bs <- newArray_ bnds
   forM_ (assocs as)$ \(i, a) -> do
     b <- do
       (ti, tb2b) <- eval a
-      tb <- lift$ traverseOf setter (readArray bs) ti
+      tb <- traverseOf setter (readArray bs) ti
       tb2b tb
-    lift$ writeArray bs i b
-  lift$ unsafeFreeze bs
+    writeArray bs i b
+  return bs
 
-cataScanT ::
-  (MonadTrans mt, Monad (mt (ST s)), Ix i)
-  => LensLike (ST s) ti ta i a
-  -> LensLike (mt (ST s)) (Array i ti) (Array i a) ta a
+cataScanT :: forall arr m ti ta i a.
+  (Monad m, MArray arr a m, Ix i)
+  => LensLike m ti ta i a
+  -> LensLike m (Array i ti) (arr i a) ta a
 cataScanT setter = hyloScanT setter . \alg ti -> return (ti, alg)
 
 anaScanT ::
-  (MonadTrans mt, Monad (mt (ST s)), Ix i)
-  => LensLike (ST s) ta t i t
-  -> LensLike (mt (ST s)) (Array i a) (Array i t) a ta
+  (Monad m, MArray arr t m, Ix i)
+  => LensLike m ta t i t
+  -> LensLike m (Array i a) (arr i t) a ta
 anaScanT setter = hyloScanT setter . \coalg a -> coalg a <&> (, return)
 
 -- MArray top-down ana
@@ -263,11 +263,15 @@ runNoConsT :: Monad m => NoConsT x m a -> m (a, [x])
 runNoConsT (NoConsT action) =
   fmap (second (`appEndo` []))$ runWriterT$ evalStateT action 0
 
+runNoConsTFrom :: Monad m => Int -> NoConsT x m a -> m (a, [x])
+runNoConsTFrom i (NoConsT action) =
+  fmap (second (`appEndo` []))$ runWriterT$ evalStateT action i
+
 nocons :: Monad m => x -> NoConsT x m Int
-nocons x = do
-  nextIx <- NoConsT get
-  NoConsT$ tell$ Endo (x:)
-  NoConsT$ put$ succ nextIx
+nocons x = NoConsT$ do
+  nextIx <- get
+  tell$ Endo (x:)
+  put$ succ nextIx
   return nextIx
 
 noConsOf :: Monad m => LensLike (NoConsT fi m) s x fi Int -> s -> m (x, [fi])
@@ -275,6 +279,7 @@ noConsOf setter = runNoConsT . setter nocons
 
 -- Building Arrays (HashCons)
 
+type HashConsT' x = HashConsT x x
 newtype HashConsT x k m a = HashConsT
   (StateT (Int, HashMap k Int) (WriterT (Endo [x]) m) a)
   deriving (Functor, Applicative, Monad)
