@@ -5,6 +5,8 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Control.RecursionSchemes.Lens where
 
@@ -95,7 +97,7 @@ anaScan setter = hyloScan setter . sets (\coalg a -> (coalg a, id))
 
 -- MArray double bottom-up recursion (the first scan is actually a fmap a -> ti)
 
-hyloScanT :: forall m arr i ti tb a b.
+hyloScanT :: forall arr i m ti tb a b.
   (Monad m, MArray arr b m, Ix i)
   => LensLike m ti tb i b
   -> LensLike m (Array i a) (arr i b) a (ti, tb -> m b)
@@ -115,6 +117,14 @@ cataScanT :: forall arr m ti ta i a.
   => LensLike m ti ta i a
   -> LensLike m (Array i ti) (arr i a) ta a
 cataScanT setter = hyloScanT setter . \alg ti -> return (ti, alg)
+
+cataScanT' :: forall arr m ti ta i a.
+  (Monad m, MArray arr a m, Ix i)
+  => LensLike m ti ta i a
+  -> LensLike m (Array i ti) (Array i a) ta a
+cataScanT' setter alg arr0 = do
+  arr <- hyloScanT @arr setter (\ti -> return (ti, alg)) arr0
+  unsafeFreeze arr
 
 anaScanT ::
   (Monad m, MArray arr t m, Ix i)
