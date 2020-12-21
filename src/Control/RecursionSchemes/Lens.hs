@@ -7,6 +7,7 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE ViewPatterns #-}
 
 module Control.RecursionSchemes.Lens where
 
@@ -258,9 +259,24 @@ cataScanT2 setter alg arr = do
 
 anaScanT2 ::
   (Ix i, Monoid g, MArray arr g m, MArray arr' t m)
-  => Traversal tgi t (g, i) t
+  => LensLike (Enclosing m (ReaderT (arr' i t) m)) tgi t (g, i) t
   -> LensLike m (arr i g) (arr' i t) (g, i) tgi
 anaScanT2 setter = hyloScanTTerminal setter . \coalg a -> coalg a <&> (, return)
+
+
+-- Graph traversals: DFS --------------------------------------------------------------
+
+dfs :: forall m g i arr g'.
+  (Monad m, MArray arr g m, Ix i, Semigroup g)
+  => LensLike m (g, i) g' (g, i) g'
+  -> arr i g
+  -> i
+  -> m g'
+dfs setter arr i = readArray arr i >>= rec . (, i) where
+  rec (g, i) = flip setter (g, i)$ \(h, j) -> do
+    ((<> h) -> child) <- readArray arr j
+    rec (child, j)
+
 
 -- Building Arrays (NoCons)
 
