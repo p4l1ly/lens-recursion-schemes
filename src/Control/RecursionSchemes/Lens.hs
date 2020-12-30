@@ -7,7 +7,6 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE ViewPatterns #-}
 
 module Control.RecursionSchemes.Lens where
 
@@ -274,8 +273,8 @@ dfs :: forall m g i arr g'.
   -> m g'
 dfs setter arr i = readArray arr i >>= rec . (, i) where
   rec (g, i) = flip setter (g, i)$ \(h, j) -> do
-    ((<> h) -> child) <- readArray arr j
-    rec (child, j)
+    child <- readArray arr j
+    rec (child <> h, j)
 
 
 -- Building Arrays (NoCons)
