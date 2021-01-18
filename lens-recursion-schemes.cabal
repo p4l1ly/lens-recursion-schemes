@@ -22,7 +22,7 @@ library
   -- other-modules:
   -- other-extensions:
   build-depends:
-    base ^>=4.13.0.0,
+    base >=4.13.0.0 && < 4.15.0.0,
     recursion-schemes ^>=5.2.1,
     array ^>=0.5.4.0,
     mtl ^>=2.2.2,
@@ -44,7 +44,7 @@ test-suite lens-recursion-schemes-test
     Test.Afa.Term
     Test.Afa.BoolP
   build-depends:
-    base ^>=4.13.0.0,
+    base >=4.13.0.0 && < 4.15.0.0,
     HUnit ^>= 1.6.1.0,
     lens ^>=4.19.2,
     recursion-schemes ^>=5.2.1,

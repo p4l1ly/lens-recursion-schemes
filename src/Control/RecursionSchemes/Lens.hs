@@ -7,13 +7,17 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FunctionalDependencies #-}
 
 module Control.RecursionSchemes.Lens where
 
 import Data.Functor.Compose
 import Control.Monad.Reader
-import Control.Monad.State
-import Control.Monad.Writer
+import Control.Monad.State.Strict
+import Control.Monad.Writer.Strict
 import Control.Arrow
 import Control.Lens
 import Data.Functor.Foldable (Recursive, Corecursive, Base, project, embed)
@@ -173,8 +177,8 @@ arrayEncloser ::
   -> (e -> arr' i b)
   -> (g, i)
   -> Enclosing m (ReaderT e m) b
-arrayEncloser gs getBs (g, j) = Enclosing
-  (readArray gs j >>= writeArray gs j . (<> g))
+arrayEncloser !gs !getBs (!g, !j) = Enclosing
+  (readArray gs j >>= \g0 -> let !g1 = g0 <> g in writeArray gs j g1)
   (asks getBs >>= \bs -> lift$ readArray bs j)
 
 arrayEncloser' ::
@@ -183,15 +187,23 @@ arrayEncloser' ::
   -> (e -> Array i b)
   -> (g, i)
   -> Enclosing m (ReaderT e m) b
-arrayEncloser' gs getBs (g, j) = Enclosing
-  (readArray gs j >>= writeArray gs j . (<> g))
+arrayEncloser' !gs !getBs (!g, !j) = Enclosing
+  (readArray gs j >>= \g0 -> let !g1 = g0 <> g in writeArray gs j g1)
   (asks getBs <&> (!j))
 
-hyloScanT00 :: forall i g tgi arr arr' m tb b cs env.
-  (Ix i, MArray arr g m, MArray arr' b m)
+class Encloser e m1 m2 a | e -> m1 m2 a where
+  actionBefore :: e -> m1 ()
+  actionAfter :: e -> m2 a
+
+instance Encloser (Enclosing m1 m2 a) m1 m2 a where
+  actionBefore (Enclosing bef _) = bef
+  actionAfter (Enclosing _ aft) = aft
+
+hyloScanT00 :: forall i g tgi arr arr' m tb b cs env encl.
+  (Ix i, MArray arr g m, MArray arr' b m, Encloser encl m (ReaderT env m) tb)
   => m cs
   -> (arr' i b -> cs -> env)
-  -> (tgi -> Enclosing m (ReaderT env m) tb)
+  -> (tgi -> encl)
   -> LensLike m (arr i g) (cs, arr' i b) (g, i) (tgi, tb -> m b)
 hyloScanT00 atTheBottom mkenv encloser eval gs = do
   bnds <- getBounds gs
@@ -200,25 +212,25 @@ hyloScanT00 atTheBottom mkenv encloser eval gs = do
   let
     step :: [i] -> m cs -> m cs
     step [] previousStep = previousStep
-    step (i:rest) previousStep = do
+    step ((!i):rest) previousStep = do
       step rest$ do
         g <- readArray gs i
         (tgi, tb2b) <- eval (g, i)
-        let Enclosing before after = encloser tgi
-        before
+        let encl = encloser tgi
+        actionBefore encl
         cs <- previousStep
-        tb <- runReaderT after$ mkenv bs cs
+        tb <- runReaderT (actionAfter encl)$ mkenv bs cs
         b <- tb2b tb
         writeArray bs i b
         return cs
 
   (, bs) <$> step (range bnds) atTheBottom
 
-hyloScanT00' :: forall i g tgi arr m tb b cs env.
-  (Ix i, MArray arr g m, MArray arr b m)
+hyloScanT00' :: forall i g tgi arr m tb b cs env encl.
+  (Ix i, MArray arr g m, MArray arr b m, Encloser encl m (ReaderT env m) tb)
   => m cs
   -> (arr i b -> cs -> env)
-  -> (tgi -> Enclosing m (ReaderT env m) tb)
+  -> (tgi -> encl)
   -> LensLike m (arr i g) (cs, arr i b) (g, i) (tgi, tb -> m b)
 hyloScanT00' = hyloScanT00
 
@@ -285,16 +297,15 @@ instance MonadTrans (NoConsT x) where
   lift = NoConsT . lift . lift
 
 runNoConsT :: Monad m => NoConsT x m a -> m (a, [x])
-runNoConsT (NoConsT action) =
-  fmap (second (`appEndo` []))$ runWriterT$ evalStateT action 0
+runNoConsT = runNoConsTFrom 0
 
 runNoConsTFrom :: Monad m => Int -> NoConsT x m a -> m (a, [x])
-runNoConsTFrom i (NoConsT action) =
+runNoConsTFrom !i (NoConsT !action) =
   fmap (second (`appEndo` []))$ runWriterT$ evalStateT action i
 
 nocons :: Monad m => x -> NoConsT x m Int
-nocons x = NoConsT$ do
-  nextIx <- get
+nocons !x = NoConsT$ do
+  !nextIx <- get
   tell$ Endo (x:)
   put$ succ nextIx
   return nextIx
@@ -311,14 +322,17 @@ newtype HashConsT x k m a = HashConsT
 instance MonadTrans (HashConsT x k) where
   lift = HashConsT . lift . lift
 
-runHashConsT :: Monad m => HashConsT x k m a -> m (a, [x])
-runHashConsT (HashConsT action) = do
-  (a, xs) <- runWriterT$ evalStateT action (0, M.empty)
+runHashConsTFrom :: Monad m => Int -> HashConsT x k m a -> m (a, [x])
+runHashConsTFrom !start (HashConsT !action) = do
+  (a, xs) <- runWriterT$ evalStateT action (start, M.empty)
   return (a, xs `appEndo` [])
 
+runHashConsT :: Monad m => HashConsT x k m a -> m (a, [x])
+runHashConsT = runHashConsTFrom 0
+
 hashCons :: (Eq k, Hashable k, Monad m) => k -> x -> HashConsT x k m Int
-hashCons key x = HashConsT$ do
-  (nextIx, hash) <- get
+hashCons !key !x = HashConsT$ do
+  (!nextIx, !hash) <- get
   ((hashedIx, nextIx'), hash') <- lift$ getCompose$
     M.alterF (handleAlter x nextIx) key hash
   put (nextIx', hash')
@@ -331,7 +345,7 @@ hashCons key x = HashConsT$ do
       return ((i, i + 1), Just i)
 
 hashCons' :: (Eq k, Hashable k, Monad m) => k -> HashConsT k k m Int
-hashCons' k = hashCons k k
+hashCons' !k = hashCons k k
 
 hashConsOf :: (Eq fi, Hashable fi, Monad m)
   => LensLike (HashConsT fi fi m) s x fi Int -> s -> m (x, [fi])
