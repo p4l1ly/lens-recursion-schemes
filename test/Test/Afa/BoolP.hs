@@ -39,10 +39,10 @@ plateBase :: Applicative f => Plate p p f
 plateBase = Plate
   { pLTrue = \() -> pure LTrue
   , pLFalse = \() -> pure LFalse
-  , pVar = \v -> pure$ Var v
-  , pNot = \p -> pure$ Not p
-  , pAnd = \ps -> pure$ And ps
-  , pOr  = \ps -> pure$ Or ps
+  , pVar = pure . Var
+  , pNot = pure . Not
+  , pAnd = pure . And
+  , pOr  = pure . Or
   }
 
 applyPlate :: Plate p p' f -> BoolP p -> f (BoolP p')
@@ -64,10 +64,10 @@ pureChildMod = ChildMod{ lP = pure, lVar = pure }
 
 childModToPlate :: Applicative f => ChildMod p p' f -> Plate p p' f
 childModToPlate ChildMod{lP, lVar} = plateBase
-  { pVar = \v -> Var <$> lVar v
-  , pNot = \p -> Not <$> lP p
-  , pAnd = \ts -> And <$> traverse lP ts
-  , pOr  = \ts -> Or <$> traverse lP ts
+  { pVar = fmap Var . lVar
+  , pNot = fmap Not . lP
+  , pAnd = fmap And . traverse lP 
+  , pOr  = fmap Or . traverse lP 
   }
 
 modChilds :: Applicative f => ChildMod p p' f -> BoolP p -> f (BoolP p')

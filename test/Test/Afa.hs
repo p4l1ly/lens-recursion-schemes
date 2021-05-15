@@ -28,9 +28,8 @@ import Control.RecursionSchemes.Lens
   , Enclosing(..)
   , hyloScanT00'
   , hyloScanTTerminal'
-  , runNoConsT
-  , nocons
   )
+import Control.RecursionSchemes.Utils.NoCons (runNoConsT, nocons)
 
 newtype LiftedArray a i e = LiftedArray (a i e)
 instance (MonadTrans mt, Monad (mt m), MArray a e m)

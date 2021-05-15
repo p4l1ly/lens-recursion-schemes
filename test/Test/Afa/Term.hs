@@ -36,10 +36,10 @@ data Plate p q t p' q' t' f = Plate
 plateBase :: Applicative f => Plate p q t p q t f
 plateBase = Plate
   { pLTrue = \() -> pure LTrue
-  , pP     = \p -> pure$ P p
-  , pQ     = \q -> pure$ Q q
-  , pAnd   = \ts -> pure$ And ts
-  , pOr    = \ts -> pure$ Or ts
+  , pP     = pure . P
+  , pQ     = pure . Q
+  , pAnd   = pure . And
+  , pOr    = pure . Or
   }
 
 applyPlate :: Plate p q t p' q' t' f -> Term p q t -> f (Term p' q' t')
@@ -61,10 +61,10 @@ pureChildMod = ChildMod{ lP = pure, lQ = pure, lT = pure }
 
 childModToPlate :: Applicative f => ChildMod p q t p' q' t' f -> Plate p q t p' q' t' f
 childModToPlate ChildMod{lP, lQ, lT} = plateBase
-  { pP   = \p -> P <$> lP p
-  , pQ   = \q -> Q <$> lQ q
-  , pAnd = \ts -> And <$> traverse lT ts
-  , pOr  = \ts -> Or <$> traverse lT ts
+  { pP   = fmap P . lP
+  , pQ   = fmap Q . lQ
+  , pAnd = fmap And . traverse lT 
+  , pOr  = fmap Or . traverse lT 
   }
 
 modChilds :: Applicative f

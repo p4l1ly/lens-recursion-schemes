@@ -30,13 +30,13 @@ import Control.RecursionSchemes.Lens
   , corecursiveSetter
   , ana
   , hylo
-  , hashConsOf
-  , noConsOf
   , cataT
   , anaT
   , recursiveTraversal
   , corecursiveTraversal
   )
+import Control.RecursionSchemes.Utils.NoCons (noConsOf)
+import Control.RecursionSchemes.Utils.HashCons (hashConsOf)
 
 import qualified Test.Afa
 
