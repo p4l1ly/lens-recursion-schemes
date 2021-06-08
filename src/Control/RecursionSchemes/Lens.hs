@@ -8,12 +8,16 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
 
 module Control.RecursionSchemes.Lens where
 
+import Data.Foldable
+import Data.Array.Base (unsafeRead, unsafeWrite, unsafeNewArray_)
 import Data.Functor.Compose
 import Control.Monad.Reader
 import Control.Monad.State.Strict
@@ -28,6 +32,10 @@ import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as M
 import Data.Hashable
 import Control.Monad.ST
+import Capability.Source
+import GHC.Types (Symbol)
+
+import Control.RecursionSchemes.Utils.HasIxed
 
 -- Standard recursion
 
@@ -112,60 +120,68 @@ anaScan setter = hyloScan setter . sets (\coalg a -> (coalg a, id))
 -- MArray double bottom-up recursion (the first scan is actually a fmap a -> ti)
 
 {-# INLINABLE hyloScanT #-}
-hyloScanT :: forall arr i m ti tb a b.
-  (Monad m, MArray arr b m, Ix i)
-  => LensLike m ti tb i b
-  -> LensLike m (Array i a) (arr i b) a (ti, tb -> m b)
+hyloScanT :: forall arr m ti tb a b.
+  (Monad m, MArray arr b m)
+  => LensLike m ti tb Int b
+  -> LensLike m (Array Int a) (arr Int b) a (ti, tb -> m b)
 hyloScanT setter eval as = do
   let bnds = bounds as
   bs <- newArray_ bnds
   forM_ (assocs as)$ \(i, a) -> do
     b <- do
       (ti, tb2b) <- eval a
-      tb <- traverseOf setter (readArray bs) ti
+      tb <- traverseOf setter (unsafeRead bs) ti
       tb2b tb
-    writeArray bs i b
+    unsafeWrite bs i b
   return bs
 
 {-# INLINABLE cataScanT #-}
-cataScanT :: forall arr m ti ta i a.
-  (Monad m, MArray arr a m, Ix i)
-  => LensLike m ti ta i a
-  -> LensLike m (Array i ti) (arr i a) ta a
+cataScanT :: forall arr m ti ta a.
+  (Monad m, MArray arr a m)
+  => LensLike m ti ta Int a
+  -> LensLike m (Array Int ti) (arr Int a) ta a
 cataScanT setter = hyloScanT setter . \alg ti -> return (ti, alg)
 
 {-# INLINABLE cataScanT' #-}
-cataScanT' :: forall arr m ti ta i a.
-  (Monad m, MArray arr a m, Ix i)
-  => LensLike m ti ta i a
-  -> LensLike m (Array i ti) (Array i a) ta a
+cataScanT' :: forall arr m ti ta a.
+  (Monad m, MArray arr a m)
+  => LensLike m ti ta Int a
+  -> LensLike m (Array Int ti) (Array Int a) ta a
 cataScanT' setter alg arr0 = do
   arr <- hyloScanT @arr setter (\ti -> return (ti, alg)) arr0
   unsafeFreeze arr
 
 {-# INLINABLE anaScanT #-}
 anaScanT ::
-  (Monad m, MArray arr t m, Ix i)
-  => LensLike m ta t i t
-  -> LensLike m (Array i a) (arr i t) a ta
+  (Monad m, MArray arr t m)
+  => LensLike m ta t Int t
+  -> LensLike m (Array Int a) (arr Int t) a ta
 anaScanT setter = hyloScanT setter . \coalg a -> coalg a <&> (, return)
+
+-- Generic cataScanT
+
+cataStep :: forall (tag :: Symbol) ti ta a m.
+  (HasIxedSource tag Int a m)
+  => LensLike m ti ta Int a
+  -> LensLike m ti a ta a
+cataStep traversal alg = traversal (iawait @tag) >=> alg
 
 -- MArray top-down ana
 
 {-# INLINABLE anaScanT2List #-}
-anaScanT2List :: forall mt i g tgi arr m tgi'.
-  (MonadTrans mt, Monad (mt m), Ix i, Semigroup g, MArray arr g m)
-  => LensLike m tgi tgi' (g, i) (g, i)
-  -> LensLike (mt m) (arr i g) [tgi'] g tgi
+anaScanT2List :: forall mt g tgi arr m tgi'.
+  (MonadTrans mt, Monad (mt m), Semigroup g, MArray arr g m)
+  => LensLike m tgi tgi' (g, Int) (g, Int)
+  -> LensLike (mt m) (arr Int g) [tgi'] g tgi
 anaScanT2List setter eval gs = do
   bnds <- lift$ getBounds gs
   (reverse <$>) . forM (reverse$ range bnds)$ \i -> do
-    g <- lift$ readArray gs i
+    g <- lift$ unsafeRead gs i
     tgi <- eval g
     lift$ flip (traverseOf setter) tgi$ \(gj, j) -> do
-      gj0 <- readArray gs j
+      gj0 <- unsafeRead gs j
       let gj' = gj0 <> gj
-      writeArray gs j gj'
+      unsafeWrite gs j gj'
       return (gj', j)
 
 -- MArray top-down-bottom-up hylo
@@ -177,38 +193,39 @@ instance Functor m2 => Functor (Enclosing m1 m2) where
 instance (Applicative m1, Applicative m2) => Applicative (Enclosing m1 m2) where
   {-# INLINABLE pure #-}
   pure x = Enclosing (pure ()) (pure x)
+  {-# INLINABLE (<*>) #-}
   Enclosing bef1 fab <*> Enclosing bef2 fa =
     Enclosing (bef2 *> bef1) (fab <*> fa)
 
 {-# INLINABLE simpleEncloser #-}
 simpleEncloser ::
-  (Ix i, Semigroup g, MArray arr' b m, MArray arr g m)
-  => LensLike (Enclosing m (ReaderT (arr' i b) m)) tgi tb (g, i) b
-  -> arr i g
+  (Semigroup g, MArray arr' b m, MArray arr g m)
+  => LensLike (Enclosing m (ReaderT (arr' Int b) m)) tgi tb (g, Int) b
+  -> arr Int g
   -> tgi
-  -> Enclosing m (ReaderT (arr' i b) m) tb
+  -> Enclosing m (ReaderT (arr' Int b) m) tb
 simpleEncloser setter gs = traverseOf setter (arrayEncloser gs id)
 
 {-# INLINABLE arrayEncloser #-}
 arrayEncloser ::
-  (Ix i, Semigroup g, MArray arr' b m, MArray arr g m)
-  => arr i g
-  -> (e -> arr' i b)
-  -> (g, i)
+  (Semigroup g, MArray arr' b m, MArray arr g m)
+  => arr Int g
+  -> (e -> arr' Int b)
+  -> (g, Int)
   -> Enclosing m (ReaderT e m) b
 arrayEncloser !gs !getBs (!g, !j) = Enclosing
-  (readArray gs j >>= \g0 -> let !g1 = g0 <> g in writeArray gs j g1)
-  (asks getBs >>= \bs -> lift$ readArray bs j)
+  (unsafeRead gs j >>= \g0 -> let !g1 = g0 <> g in unsafeWrite gs j g1)
+  (asks getBs >>= \bs -> lift$ unsafeRead bs j)
 
 {-# INLINABLE arrayEncloser' #-}
 arrayEncloser' ::
-  (Ix i, Semigroup g, MArray arr g m)
-  => arr i g
-  -> (e -> Array i b)
-  -> (g, i)
+  (Semigroup g, MArray arr g m)
+  => arr Int g
+  -> (e -> Array Int b)
+  -> (g, Int)
   -> Enclosing m (ReaderT e m) b
 arrayEncloser' !gs !getBs (!g, !j) = Enclosing
-  (readArray gs j >>= \g0 -> let !g1 = g0 <> g in writeArray gs j g1)
+  (unsafeRead gs j >>= \g0 -> let !g1 = g0 <> g in unsafeWrite gs j g1)
   (asks getBs <&> (!j))
 
 class Encloser e m1 m2 a | e -> m1 m2 a where
@@ -216,59 +233,86 @@ class Encloser e m1 m2 a | e -> m1 m2 a where
   actionAfter :: e -> m2 a
 
 instance Encloser (Enclosing m1 m2 a) m1 m2 a where
+  {-# INLINABLE actionBefore #-}
   actionBefore (Enclosing bef _) = bef
+  {-# INLINABLE actionAfter #-}
   actionAfter (Enclosing _ aft) = aft
 
 {-# INLINABLE hyloScanT00 #-}
-hyloScanT00 :: forall i g tgi arr arr' m tb b cs env encl.
-  (Ix i, MArray arr g m, MArray arr' b m, Encloser encl m (ReaderT env m) tb)
+hyloScanT00 :: forall g tgi arr arr' m tb b cs env encl.
+  (MArray arr g m, MArray arr' b m, Encloser encl m (ReaderT env m) tb)
   => m cs
-  -> (arr' i b -> cs -> env)
+  -> (arr' Int b -> cs -> env)
   -> (tgi -> encl)
-  -> LensLike m (arr i g) (cs, arr' i b) (g, i) (tgi, tb -> m b)
+  -> LensLike m (arr Int g) (cs, arr' Int b) (g, Int) (tgi, tb -> m b)
 hyloScanT00 atTheBottom mkenv encloser eval gs = do
   bnds <- getBounds gs
   bs <- newArray_ bnds
 
   let
-    step :: [i] -> m cs -> m cs
+    step :: [Int] -> m cs -> m cs
     step [] previousStep = previousStep
     step ((!i):rest) previousStep = do
       step rest$ do
-        g <- readArray gs i
+        g <- unsafeRead gs i
         (tgi, tb2b) <- eval (g, i)
         let encl = encloser tgi
         actionBefore encl
         cs <- previousStep
         tb <- runReaderT (actionAfter encl)$ mkenv bs cs
         b <- tb2b tb
-        writeArray bs i b
+        unsafeWrite bs i b
         return cs
 
   (, bs) <$> step (range bnds) atTheBottom
 
-{-# INLINABLE hyloScanT00' #-}
-hyloScanT00' :: forall i g tgi arr m tb b cs env encl.
-  (Ix i, MArray arr g m, MArray arr b m, Encloser encl m (ReaderT env m) tb)
+{-# INLINABLE hyloScanTFast #-}
+hyloScanTFast :: forall arr' g tgi arr m tb b cs env encl.
+  (MArray arr g m, MArray arr' b m)
   => m cs
-  -> (arr i b -> cs -> env)
+  -> (g -> Int -> m ())
+  -> (arr' Int b -> cs -> g -> Int -> m b)
+  -> arr Int g
+  -> m (cs, arr' Int b)
+hyloScanTFast atTheBottom coalg alg gs = do
+  bnds@(ibeg, iend) <- getBounds gs
+
+  for_ [iend, iend - 1 .. ibeg]$ \i -> do
+    g <- unsafeRead gs i
+    coalg g i
+
+  cs <- atTheBottom
+  bs <- unsafeNewArray_ bnds
+
+  for_ [ibeg .. iend]$ \i -> do
+    g <- unsafeRead gs i
+    b <- alg bs cs g i
+    unsafeWrite bs i b
+
+  return (cs, bs)
+
+{-# INLINABLE hyloScanT00' #-}
+hyloScanT00' :: forall g tgi arr m tb b cs env encl.
+  (MArray arr g m, MArray arr b m, Encloser encl m (ReaderT env m) tb)
+  => m cs
+  -> (arr Int b -> cs -> env)
   -> (tgi -> encl)
-  -> LensLike m (arr i g) (cs, arr i b) (g, i) (tgi, tb -> m b)
+  -> LensLike m (arr Int g) (cs, arr Int b) (g, Int) (tgi, tb -> m b)
 hyloScanT00' = hyloScanT00
 
 {-# INLINABLE hyloScanTTerminal #-}
-hyloScanTTerminal :: forall i g tgi arr arr' m tb b.
-  (Ix i, Semigroup g, MArray arr g m, MArray arr' b m)
-  => LensLike (Enclosing m (ReaderT (arr' i b) m)) tgi tb (g, i) b
-  -> LensLike m (arr i g) (arr' i b) (g, i) (tgi, tb -> m b)
+hyloScanTTerminal :: forall g tgi arr arr' m tb b.
+  (Semigroup g, MArray arr g m, MArray arr' b m)
+  => LensLike (Enclosing m (ReaderT (arr' Int b) m)) tgi tb (g, Int) b
+  -> LensLike m (arr Int g) (arr' Int b) (g, Int) (tgi, tb -> m b)
 hyloScanTTerminal setter eval gs =
   snd <$> hyloScanT00 (return ()) const (simpleEncloser setter gs) eval gs
 
 {-# INLINABLE hyloScanTTerminal' #-}
-hyloScanTTerminal' :: forall i g tgi arr m tb b.
-  (Ix i, Semigroup g, MArray arr g m, MArray arr b m)
-  => LensLike (Enclosing m (ReaderT (arr i b) m)) tgi tb (g, i) b
-  -> LensLike m (arr i g) (arr i b) (g, i) (tgi, tb -> m b)
+hyloScanTTerminal' :: forall g tgi arr m tb b.
+  (Semigroup g, MArray arr g m, MArray arr b m)
+  => LensLike (Enclosing m (ReaderT (arr Int b) m)) tgi tb (g, Int) b
+  -> LensLike m (arr Int g) (arr Int b) (g, Int) (tgi, tb -> m b)
 hyloScanTTerminal' setter eval gs =
   snd <$> hyloScanT00 (return ()) const (simpleEncloser setter gs) eval gs
 
@@ -280,41 +324,40 @@ instance Semigroup (Keep a) where
 -- Semantically equivalent to cataScanT but a bit more complex to implement
 -- via hyloScanT2 as we need to make some dummy operations for types to fit.
 {-# INLINABLE cataScanT2 #-}
-cataScanT2 :: forall i ti arr arr' m ta a.
-  ( Ix i
-  , MArray arr ti m
+cataScanT2 :: forall ti arr arr' m ta a.
+  ( MArray arr ti m
   , MArray arr (Keep ti) m
   , MArray arr' a m
   )
-  => Traversal ti ta i a
-  -> LensLike m (arr i ti) (arr' i a) ta a
+  => Traversal ti ta Int a
+  -> LensLike m (arr Int ti) (arr' Int a) ta a
 cataScanT2 setter alg arr = do
   let setter' ktii2a = setter (ktii2a . (undefined,))
   let hyloAlg (Keep ti, _) = return (ti, alg)
-  (arr' :: Array i ti) <- unsafeFreeze arr  -- noop
-  (arr'' :: arr i (Keep ti)) <- unsafeThaw$ fmap Keep arr'  -- noop
+  (arr' :: Array Int ti) <- unsafeFreeze arr  -- noop
+  (arr'' :: arr Int (Keep ti)) <- unsafeThaw$ fmap Keep arr'  -- noop
   hyloScanTTerminal setter' hyloAlg arr''
 
 {-# INLINABLE anaScanT2 #-}
 anaScanT2 ::
-  (Ix i, Monoid g, MArray arr g m, MArray arr' t m)
-  => LensLike (Enclosing m (ReaderT (arr' i t) m)) tgi t (g, i) t
-  -> LensLike m (arr i g) (arr' i t) (g, i) tgi
+  (Monoid g, MArray arr g m, MArray arr' t m)
+  => LensLike (Enclosing m (ReaderT (arr' Int t) m)) tgi t (g, Int) t
+  -> LensLike m (arr Int g) (arr' Int t) (g, Int) tgi
 anaScanT2 setter = hyloScanTTerminal setter . \coalg a -> coalg a <&> (, return)
 
 
 -- Graph traversals: DFS --------------------------------------------------------------
 
 {-# INLINABLE dfs #-}
-dfs :: forall m g i arr g'.
-  (Monad m, MArray arr g m, Ix i, Semigroup g)
-  => LensLike m (g, i) g' (g, i) g'
-  -> arr i g
-  -> i
+dfs :: forall m g arr g'.
+  (Monad m, MArray arr g m, Semigroup g)
+  => LensLike m (g, Int) g' (g, Int) g'
+  -> arr Int g
+  -> Int
   -> m g'
-dfs setter arr i = readArray arr i >>= rec . (, i) where
+dfs setter arr i = unsafeRead arr i >>= rec . (, i) where
   rec (g, i) = flip setter (g, i)$ \(h, j) -> do
-    child <- readArray arr j
+    child <- unsafeRead arr j
     rec (child <> h, j)
 
 -- Specialization for the recursion-schemes (and other) library compatibility
